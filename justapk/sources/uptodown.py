@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+import hashlib
+import re
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+import requests
+
+from justapk.models import AppInfo, DownloadResult
+from justapk.sources.base import APKSource
+from justapk.utils import download_file, sha256_file
+
+# Reverse-engineered from Uptodown Android app v7.07
+_API_BASE = "https://www.uptodown.app/eapi"
+_APIKEY_SECRET = "$(=a%\u00b7!45J&S"  # $(=a%·!45J&S
+
+
+def _generate_apikey() -> str:
+    """Generate hourly-rotating API key: sha256(secret + hourEpoch)."""
+    now = datetime.now(UTC)
+    epoch_ms = int(now.timestamp() * 1000)
+    offset_ms = now.minute * 60000 + now.second * 1000 + now.microsecond // 1000
+    hour_epoch = (epoch_ms - offset_ms) // 1000
+    raw = _APIKEY_SECRET + str(hour_epoch)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _api_headers() -> dict[str, str]:
+    return {
+        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 14; SM-G955F "
+                       "Build/AP2A.240805.005)",
+        "Identificador": "Uptodown_Android",
+        "Identificador-Version": "707",
+        "APIKEY": _generate_apikey(),
+    }
+
+
+class UptodownSource(APKSource):
+    name = "uptodown"
+
+    def __init__(self):
+        self.session = requests.Session()
+
+    def _api_get(self, path: str) -> requests.Response:
+        """Make authenticated API request."""
+        return self.session.get(
+            f"{_API_BASE}{path}",
+            headers=_api_headers(),
+            timeout=30,
+        )
+
+    def search(self, query: str) -> list[AppInfo]:
+        resp = self._api_get(f"/v2/apps/search/{query}?page[limit]=30&page[offset]=0")
+        resp.raise_for_status()
+        data = resp.json()
+
+        items = data.get("data", {}).get("results", [])
+        if not items and isinstance(data, list):
+            items = data
+
+        results = []
+        for item in items:
+            pkg = item.get("packageName") or item.get("packagename", "")
+            name = item.get("name", pkg)
+            app_id = item.get("appID") or item.get("id", "")
+            results.append(AppInfo(
+                package=pkg or str(app_id),
+                name=name,
+                version="",
+                source=self.name,
+            ))
+        return results
+
+    def get_info(self, package: str) -> AppInfo | None:
+        app_id = self._resolve_app_id(package)
+        if not app_id:
+            return None
+        detail = self._get_detail(app_id)
+        if not detail:
+            return None
+        return AppInfo(
+            package=detail.get("packagename") or package,
+            name=detail.get("name", package),
+            version=detail.get("lastVersion", "") or str(detail.get("lastVersionCode", "")),
+            source=self.name,
+            description=detail.get("shortDescription", ""),
+        )
+
+    def _resolve_app_id(self, package: str) -> str | None:
+        """Resolve package name to Uptodown app ID."""
+        resp = self._api_get(f"/apps/byPackagename/{package}")
+        if resp.status_code == 200:
+            data = resp.json()
+            inner = data.get("data", data)
+            app_id = inner.get("appID") or inner.get("id")
+            if app_id:
+                return str(app_id)
+
+        # Search as fallback — only return exact package match
+        resp = self._api_get(f"/v2/apps/search/{package}?page[limit]=5&page[offset]=0")
+        if resp.status_code == 200:
+            data = resp.json()
+            items = data.get("data", {}).get("results", [])
+            for item in items:
+                pkg = item.get("packageName") or item.get("packagename", "")
+                if pkg == package:
+                    return str(item.get("appID") or item.get("id"))
+        return None
+
+    def _get_detail(self, app_id: str) -> dict | None:
+        """Get app details via API."""
+        resp = self._api_get(f"/v3/apps/{app_id}/device/0?countryIsoCode=US")
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data.get("data", data)
+
+    def download(self, package: str, output_dir: Path, version: str | None = None) -> DownloadResult:
+        app_id = self._resolve_app_id(package)
+        if not app_id:
+            raise RuntimeError(f"[uptodown] App not found: {package}")
+
+        detail = self._get_detail(app_id)
+        if not detail:
+            raise RuntimeError(f"[uptodown] Cannot get details for: {package}")
+
+        real_pkg = detail.get("packagename") or package
+        ver = version or detail.get("lastVersion", "") or str(detail.get("lastVersionCode", ""))
+
+        # Extract slug from urlShare: https://{slug}.uptodown.com/android
+        slug = ""
+        url_share = detail.get("urlShare", "")
+        if url_share:
+            m = re.match(r"https://([^.]+)\.uptodown\.com", url_share)
+            if m:
+                slug = m.group(1)
+
+        if not slug:
+            raise RuntimeError(f"[uptodown] Cannot determine slug for: {package}")
+
+        dl_url, dl_headers = self._get_download_url_web(slug)
+        if not dl_url:
+            raise RuntimeError(f"[uptodown] No download URL for: {package}")
+
+        filename = f"{real_pkg}-{ver}.apk" if ver else f"{real_pkg}.apk"
+        out_path = output_dir / filename
+
+        sys.stderr.write(f"[uptodown] Downloading {real_pkg} v{ver}\n")
+        size = download_file(dl_url, out_path, self.session, headers=dl_headers)
+
+        return DownloadResult(
+            path=out_path,
+            package=real_pkg,
+            version=ver,
+            source=self.name,
+            size=size,
+            sha256=sha256_file(out_path),
+        )
+
+    def _get_download_url_web(self, slug: str) -> tuple[str | None, dict[str, str]]:
+        """Get download URL + required headers from web page (data-url token)."""
+        from bs4 import BeautifulSoup
+
+        _browser_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+        )
+        referer = f"https://{slug}.en.uptodown.com/"
+        resp = self.session.get(
+            f"https://{slug}.en.uptodown.com/android/download",
+            headers={"User-Agent": _browser_ua, "Referer": referer},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return None, {}
+        soup = BeautifulSoup(resp.text, "lxml")
+        btn = soup.select_one("#detail-download-button")
+        if not btn or not btn.get("data-url"):
+            return None, {}
+        # CDN requires Referer + browser UA — pass as per-request headers
+        cdn_headers = {"Referer": referer, "User-Agent": _browser_ua}
+        return f"https://dw.uptodown.com/dwn/{btn['data-url']}", cdn_headers
