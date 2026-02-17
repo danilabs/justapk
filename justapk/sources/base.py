@@ -38,5 +38,14 @@ class APKSource(ABC):
             return [(info.version, "")]
         return []
 
+    def list_developer_apps(self, developer: str) -> list[AppInfo]:
+        """Return all apps published by a developer.
+
+        *developer* is the developer name or slug as used by this source.
+        Sources that support developer pages should override this.
+        Default implementation returns an empty list.
+        """
+        return []
+
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} ({self.name})>"

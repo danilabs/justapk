@@ -108,6 +108,58 @@ class APKMirrorSource(APKSource):
             source=self.name,
         )
 
+    def list_developer_apps(self, developer: str) -> list[AppInfo]:
+        slug = re.sub(r'[^a-z0-9]+', '-', developer.lower()).strip('-')
+        apps: list[AppInfo] = []
+        seen: set[str] = set()
+        url: str | None = f"{self.BASE}/apk/{slug}/"
+
+        while url:
+            resp = self.session.get(url, timeout=HTTP_TIMEOUT)
+            if resp.status_code != 200:
+                break
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            for row in soup.select(".appRow"):
+                a = row.select_one("h5 a[href]")
+                if not a:
+                    continue
+                name = a.get_text(strip=True)
+                href = a.get("href", "")
+                if href in seen:
+                    continue
+                seen.add(href)
+
+                # Resolve the real package name from the app page
+                app_url = f"{self.BASE}{href}" if not href.startswith("http") else href
+                try:
+                    app_resp = self.session.get(app_url, timeout=HTTP_TIMEOUT)
+                    if app_resp.status_code == 200:
+                        pkg_m = re.search(
+                            r'<span[^>]*>\s*([\w.]+(?:\.[\w]+){2,})\s*</span>',
+                            app_resp.text,
+                        )
+                        if not pkg_m:
+                            pkg_m = re.search(r'id=([\w.]+(?:\.[\w]+){2,})', app_resp.text)
+                        pkg = pkg_m.group(1) if pkg_m else href.strip("/").split("/")[-1]
+                    else:
+                        pkg = href.strip("/").split("/")[-1]
+                except Exception:
+                    pkg = href.strip("/").split("/")[-1]
+
+                apps.append(AppInfo(
+                    package=pkg, name=name, version="", source=self.name,
+                ))
+
+            next_link = soup.select_one("a.nextpostslink[href]")
+            if next_link:
+                href = next_link.get("href", "")
+                url = f"{self.BASE}{href}" if not href.startswith("http") else href
+            else:
+                url = None
+
+        return apps
+
     def list_versions(self, package: str) -> list[tuple[str, str]]:
         slug = self._find_app_slug(package)
         if not slug:

@@ -48,6 +48,20 @@ def main(argv: list[str] | None = None) -> int:
     cv.add_argument("file", type=Path, help="Path to .xapk or .apks file")
     cv.add_argument("-o", "--output", type=Path, help="Output directory (default: same as input)")
 
+    # developer
+    dev = sub.add_parser("developer", help="List or download all apps from a developer")
+    dev.add_argument("name", help="Developer name (e.g. 'Telegram FZ-LLC')")
+    dev.add_argument("-s", "--source", choices=SOURCE_PRIORITY, help="Source to query")
+    dev.add_argument("-o", "--output", type=Path, default=Path("."), help="Output directory")
+    dev.add_argument(
+        "--download", action="store_true",
+        help="Download all apps (default: list only)",
+    )
+    dev.add_argument(
+        "--no-convert", action="store_true",
+        help="Do not auto-convert XAPK/split APK to APK",
+    )
+
     # sources
     sub.add_parser("sources", help="List available sources")
 
@@ -66,6 +80,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_search(args)
         elif args.command == "info":
             return _cmd_info(args)
+        elif args.command == "developer":
+            return _cmd_developer(args)
         elif args.command == "convert":
             return _cmd_convert(args)
     except KeyboardInterrupt:
@@ -227,6 +243,27 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         "size": size,
         "sha256": sha256_file(apk_path),
     }, indent=2))
+    return 0
+
+
+def _cmd_developer(args: argparse.Namespace) -> int:
+    dl = APKDownloader(auto_convert_xapk=not args.no_convert)
+
+    if args.download:
+        results = dl.download_developer(
+            developer=args.name,
+            output_dir=args.output,
+            source=args.source,
+        )
+        print(json.dumps([r.to_dict() for r in results], indent=2))
+    else:
+        log_header(f"Apps by developer: {args.name}")
+        apps = dl.developer_apps(args.name, source=args.source)
+        if not apps:
+            log_fail(f"No apps found for developer: {args.name}")
+            return 1
+        log_ok(f"Found {len(apps)} app(s)")
+        print(json.dumps([a.to_dict() for a in apps], indent=2))
     return 0
 
 

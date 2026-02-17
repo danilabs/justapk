@@ -155,6 +155,49 @@ class APKPureSource(APKSource):
             description=detail.get("description_short", ""),
         )
 
+    def list_developer_apps(self, developer: str) -> list[AppInfo]:
+        from urllib.parse import quote
+
+        session = self._get_web_session()
+        apps: list[AppInfo] = []
+        seen: set[str] = set()
+        page = 1
+
+        while True:
+            url = f"{_WEB_BASE}/en/developer/{quote(developer)}"
+            if page > 1:
+                url += f"?page={page}"
+            resp = session.get(url, timeout=HTTP_TIMEOUT)
+            if resp.status_code != 200:
+                break
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            found = 0
+            for a in soup.select("a[href]"):
+                href = a.get("href", "").strip("/")
+                parts = href.split("/")
+                if len(parts) >= 2 and "." in parts[-1]:
+                    pkg = parts[-1]
+                    if pkg in seen:
+                        continue
+                    seen.add(pkg)
+                    name_el = a.select_one(".p1, .app-title, span")
+                    name = name_el.get_text(strip=True) if name_el else a.get_text(strip=True)
+                    if name and pkg:
+                        apps.append(AppInfo(
+                            package=pkg, name=name, version="", source=self.name,
+                        ))
+                        found += 1
+
+            if found == 0:
+                break
+            next_link = soup.select_one("a.nextpostslink[href], a[rel='next'][href]")
+            if not next_link:
+                break
+            page += 1
+
+        return apps
+
     def list_versions(self, package: str) -> list[tuple[str, str]]:
         slug = self._find_slug(package)
         if not slug:

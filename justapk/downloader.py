@@ -195,6 +195,77 @@ class APKDownloader:
             sha256=sha256_file(apk_path),
         )
 
+    def developer_apps(
+        self,
+        developer: str,
+        source: str | None = None,
+    ) -> list[AppInfo]:
+        """List all apps from a developer across sources."""
+        if source:
+            src_obj = self._get_source(source)
+            log_step(1, 1, f"Querying {source}...")
+            return src_obj.list_developer_apps(developer)
+
+        results: list[AppInfo] = []
+        seen_pkgs: set[str] = set()
+        sources = self._iter_sources()
+        for i, (name, src) in enumerate(sources, 1):
+            try:
+                log_step(i, len(sources), f"Querying {name}...")
+                for app in src.list_developer_apps(developer):
+                    if app.package not in seen_pkgs:
+                        seen_pkgs.add(app.package)
+                        results.append(app)
+            except Exception as e:
+                log_fail(f"{name}: {e}")
+        return results
+
+    def download_developer(
+        self,
+        developer: str,
+        output_dir: Path | None = None,
+        source: str | None = None,
+    ) -> list[DownloadResult]:
+        """Download all apps from a developer."""
+        output_dir = output_dir or Path(".")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        log_header(f"Listing apps for developer: {developer}")
+        apps = self.developer_apps(developer, source=source)
+        if not apps:
+            raise RuntimeError(f"No apps found for developer: {developer}")
+
+        log_ok(f"Found {len(apps)} app(s)")
+        log_header(f"Downloading {len(apps)} app(s)")
+
+        t0 = time.monotonic()
+        results: list[DownloadResult] = []
+        failed = 0
+        for i, app in enumerate(apps, 1):
+            try:
+                log_step(i, len(apps), f"{app.name} ({app.package})")
+                result = self.download(
+                    app.package, output_dir, source=app.source or source,
+                )
+                results.append(result)
+                log_ok(f"{result.path.name} ({format_size(result.size)})")
+            except Exception as e:
+                log_fail(f"{app.package}: {e}")
+                failed += 1
+
+        elapsed = time.monotonic() - t0
+        total_size = sum(r.size for r in results)
+        log_header("Done")
+        log_info(
+            f"{len(results)} downloaded, {failed} failed, "
+            f"{format_size(total_size)} total in {format_elapsed(elapsed)}"
+        )
+
+        if not results:
+            raise RuntimeError(f"Failed to download any app for developer: {developer}")
+
+        return results
+
     def search(self, query: str, source: str | None = None) -> list[AppInfo]:
         if source:
             return self._get_source(source).search(query)

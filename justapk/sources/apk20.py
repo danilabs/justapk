@@ -148,6 +148,31 @@ class APK20Source(APKSource):
 
         return version_map
 
+    def list_developer_apps(self, developer: str) -> list[AppInfo]:
+        resp = self.session.get(f"{self.BASE}/developer/{developer}", timeout=HTTP_TIMEOUT)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        apps: list[AppInfo] = []
+        seen: set[str] = set()
+        for a in soup.select("a[href*='/apk/']"):
+            href = a.get("href", "")
+            m = re.search(r'/apk/([\w.]+(?:\.[\w]+){2,})(?:/|$)', href)
+            if not m:
+                continue
+            pkg = m.group(1)
+            if pkg in seen:
+                continue
+            seen.add(pkg)
+            name = a.get_text(strip=True)
+            if name and "DOWNLOAD" not in name:
+                apps.append(AppInfo(
+                    package=pkg, name=name, version="", source=self.name,
+                ))
+        return apps
+
     def list_versions(self, package: str) -> list[tuple[str, str]]:
         return [(v, "") for v in self._get_version_map(package).keys()]
 

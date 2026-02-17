@@ -111,6 +111,50 @@ class APKComboSource(APKSource):
             source=self.name,
         )
 
+    def list_developer_apps(self, developer: str) -> list[AppInfo]:
+        from urllib.parse import quote
+
+        apps: list[AppInfo] = []
+        seen: set[str] = set()
+        page = 1
+
+        while True:
+            url = f"{self.BASE}/en/developer/{quote(developer)}/"
+            if page > 1:
+                url += f"?page={page}"
+            resp = self.session.get(url, timeout=HTTP_TIMEOUT)
+            if resp.status_code != 200:
+                break
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            found = 0
+            for a in soup.select(".content-apps a[href]"):
+                href = a.get("href", "").strip("/")
+                parts = href.split("/")
+                if len(parts) >= 2 and "." in parts[-1]:
+                    pkg = parts[-1]
+                    if pkg in seen:
+                        continue
+                    seen.add(pkg)
+                    name_el = a.select_one("span.name")
+                    name = (
+                        name_el.get_text(strip=True) if name_el
+                        else a.get_text(strip=True)
+                    )
+                    apps.append(AppInfo(
+                        package=pkg, name=name, version="", source=self.name,
+                    ))
+                    found += 1
+
+            if found == 0:
+                break
+            next_link = soup.select_one("a[href*='page=']")
+            if not next_link or f"page={page + 1}" not in next_link.get("href", ""):
+                break
+            page += 1
+
+        return apps
+
     def list_versions(self, package: str) -> list[tuple[str, str]]:
         slug = self._find_slug(package)
         if not slug:
