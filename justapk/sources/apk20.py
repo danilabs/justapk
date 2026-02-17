@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from pathlib import Path
 
 from bs4 import BeautifulSoup
 
 from justapk.models import AppInfo, DownloadResult
 from justapk.sources.base import APKSource
-from justapk.utils import HTTP_TIMEOUT, create_session, download_file, sha256_file
+from justapk.utils import HTTP_TIMEOUT, create_session, download_file, log_source, sha256_file
 
 
 class APK20Source(APKSource):
@@ -23,10 +22,14 @@ class APK20Source(APKSource):
     def _parse_rsc_apps(self, text: str) -> list[dict]:
         """Parse Next.js RSC payload for app objects."""
         results = []
-        seen = set()
+        seen: set[str] = set()
         for m in re.finditer(r'self\.__next_f\.push\(\[1,"(.+?)"\]\)', text):
             chunk = m.group(1).replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\")
-            for arr_m in re.finditer(r'\[(\{[^]]*"packageName"[^]]*\}(?:,\{[^]]*"packageName"[^]]*\})*)\]', chunk):
+            for arr_m in re.finditer(
+                r'\[(\{[^]]*"packageName"[^]]*\}'
+                r'(?:,\{[^]]*"packageName"[^]]*\})*)\]',
+                chunk,
+            ):
                 try:
                     data = json.loads(f"[{arr_m.group(1)}]")
                     for item in data:
@@ -108,34 +111,92 @@ class APK20Source(APKSource):
         multipliers = {"GB": 1024**3, "MB": 1024**2, "KB": 1024}
         return int(val * multipliers.get(unit, 1))
 
-    def download(self, package: str, output_dir: Path, version: str | None = None) -> DownloadResult:
-        # Fetch app page once — extract version code + version name
+    def _get_version_map(self, package: str) -> dict[str, str]:
+        """Fetch app page and return {version_name: version_code} mapping."""
+        resp = self.session.get(f"{self.BASE}/apk/{package}", timeout=HTTP_TIMEOUT)
+        if resp.status_code == 404:
+            return {}
+        resp.raise_for_status()
+
+        # Parse version links: /apk/{package}/{version_code}
+        # Text: "AppName vX.Y.Z"
+        version_map: dict[str, str] = {}
+        for m in re.finditer(
+            rf'/apk/{re.escape(package)}/(\d+)',
+            resp.text,
+        ):
+            code = m.group(1)
+            # Find the version name near this link
+            start = max(0, m.start() - 200)
+            context = resp.text[start:m.end() + 200]
+            ver_m = re.search(r'v([\d]+(?:\.[\d]+)+)', context)
+            if ver_m:
+                version_map[ver_m.group(1)] = code
+
+        # Also extract from download links
+        for m in re.finditer(
+            rf'/apk/{re.escape(package)}/download/(\d+)',
+            resp.text,
+        ):
+            code = m.group(1)
+            if code not in version_map.values():
+                start = max(0, m.start() - 200)
+                context = resp.text[start:m.end() + 200]
+                ver_m = re.search(r'v([\d]+(?:\.[\d]+)+)', context)
+                if ver_m and ver_m.group(1) not in version_map:
+                    version_map[ver_m.group(1)] = code
+
+        return version_map
+
+    def list_versions(self, package: str) -> list[tuple[str, str]]:
+        return [(v, "") for v in self._get_version_map(package).keys()]
+
+    def download(
+        self, package: str, output_dir: Path, version: str | None = None,
+    ) -> DownloadResult:
+        # Fetch app page — extract version map
         resp = self.session.get(f"{self.BASE}/apk/{package}", timeout=HTTP_TIMEOUT)
         if resp.status_code == 404:
             raise RuntimeError(f"[apk20] Package not found: {package}")
         resp.raise_for_status()
 
-        m = re.search(rf'/apk/{re.escape(package)}/download/(\d+)', resp.text)
-        if not m:
-            codes = re.findall(r'"versionCode":\s*(\d+)', resp.text)
-            if not codes:
-                raise RuntimeError(f"[apk20] No versions found for: {package}")
-            version_code = codes[0]
+        if version:
+            # Find version code for the requested version
+            version_map = self._get_version_map(package)
+            version_code = version_map.get(version)
+            if not version_code:
+                available = list(version_map.keys())[:5]
+                raise RuntimeError(
+                    f"[apk20] Version {version} not found for {package}. "
+                    f"Available: {', '.join(available)}"
+                )
+            ver = version
         else:
-            version_code = m.group(1)
+            # Latest: use primary download link
+            m = re.search(rf'/apk/{re.escape(package)}/download/(\d+)', resp.text)
+            if not m:
+                codes = re.findall(r'"versionCode":\s*(\d+)', resp.text)
+                if not codes:
+                    raise RuntimeError(f"[apk20] No versions found for: {package}")
+                version_code = codes[0]
+            else:
+                version_code = m.group(1)
 
-        info = self._parse_app_page(package, resp.text)
-        ver = info.version or "unknown"
+            info = self._parse_app_page(package, resp.text)
+            ver = info.version or "unknown"
 
         # Verify + get download URL
         verify_resp = self.session.get(
-            f"{self.BASE}/api/verify/{package}/{version_code}", timeout=HTTP_TIMEOUT
+            f"{self.BASE}/api/verify/{package}/{version_code}",
+            timeout=HTTP_TIMEOUT,
         )
         verify_resp.raise_for_status()
         verify_data = verify_resp.json()
 
         if not verify_data.get("success"):
-            raise RuntimeError(f"[apk20] Verify failed: {verify_data.get('message', 'unknown error')}")
+            raise RuntimeError(
+                f"[apk20] Verify failed: {verify_data.get('message', 'unknown error')}"
+            )
 
         filename = verify_data["filename"]
         dl_url = f"{self.FILE_SERVER}/{filename}"
@@ -143,7 +204,7 @@ class APK20Source(APKSource):
         out_filename = f"{package}-{ver}{_ext(filename)}"
         out_path = output_dir / out_filename
 
-        sys.stderr.write(f"[apk20] Downloading {package} v{ver}\n")
+        log_source(self.name, f"Downloading {package} v{ver}")
         size = download_file(dl_url, out_path, self.session)
 
         return DownloadResult(

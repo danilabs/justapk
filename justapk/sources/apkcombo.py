@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import re
-import sys
 from pathlib import Path
 
 from bs4 import BeautifulSoup
 
 from justapk.models import AppInfo, DownloadResult
 from justapk.sources.base import APKSource
-from justapk.utils import HTTP_TIMEOUT, create_cf_session, download_file, sha256_file
+from justapk.utils import HTTP_TIMEOUT, create_cf_session, download_file, log_source, sha256_file
 
 
 class APKComboSource(APKSource):
@@ -61,6 +60,38 @@ class APKComboSource(APKSource):
                         return parts[i - 1]
         return None
 
+    def _find_version_download_url(self, slug: str, package: str, version: str) -> str | None:
+        """Find the download page URL for a specific version from old-versions listing."""
+        page = 1
+        while True:
+            url = f"{self.BASE}/{slug}/{package}/old-versions/"
+            if page > 1:
+                url += f"?page={page}"
+            resp = self.session.get(url, timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            found_any = False
+            for a in soup.select("ul li a[href*='/download/']"):
+                found_any = True
+                h3 = a.select_one("h3")
+                if not h3:
+                    continue
+                text = h3.get_text(strip=True)
+                m = re.search(r'([\d]+(?:\.[\d]+)+)', text)
+                if m and m.group(1) == version:
+                    href = str(a.get("href", ""))
+                    return href if href.startswith("http") else f"{self.BASE}{href}"
+
+            if not found_any:
+                break
+            next_link = soup.select_one("a[href*='page=']")
+            if not next_link or f"page={page + 1}" not in next_link.get("href", ""):
+                break
+            page += 1
+
+        return None
+
     def get_info(self, package: str) -> AppInfo | None:
         slug = self._find_slug(package)
         if not slug:
@@ -80,13 +111,63 @@ class APKComboSource(APKSource):
             source=self.name,
         )
 
+    def list_versions(self, package: str) -> list[tuple[str, str]]:
+        slug = self._find_slug(package)
+        if not slug:
+            return []
+
+        versions: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        page = 1
+
+        while True:
+            url = f"{self.BASE}/{slug}/{package}/old-versions/"
+            if page > 1:
+                url += f"?page={page}"
+            resp = self.session.get(url, timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            found = 0
+            for a in soup.select("ul li a[href*='/download/']"):
+                h3 = a.select_one("h3")
+                if not h3:
+                    continue
+                text = h3.get_text(strip=True)
+                # Extract version from "AppName X.Y.Z APK"
+                m = re.search(r'([\d]+(?:\.[\d]+)+)', text)
+                if m:
+                    v = m.group(1)
+                    if v not in seen:
+                        seen.add(v)
+                        date_el = a.select_one("span.date")
+                        date_str = date_el.get_text(strip=True) if date_el else ""
+                        versions.append((v, date_str))
+                        found += 1
+
+            # Check for next page
+            if found == 0:
+                break
+            next_link = soup.select_one("a[href*='page=']")
+            if not next_link or f"page={page + 1}" not in next_link.get("href", ""):
+                break
+            page += 1
+
+        return versions
+
     def download(self, package: str, output_dir: Path, version: str | None = None) -> DownloadResult:
         slug = self._find_slug(package)
         if not slug:
             raise RuntimeError(f"[apkcombo] Package not found: {package}")
 
-        # Download page URL
-        page_url = f"{self.BASE}/{slug}/{package}/download/apk"
+        # Download page URL — for a specific version, find its URL from old-versions
+        if version:
+            page_url = self._find_version_download_url(slug, package, version)
+            if not page_url:
+                raise RuntimeError(f"[apkcombo] Version {version} not found for {package}")
+        else:
+            page_url = f"{self.BASE}/{slug}/{package}/download/apk"
+
         resp = self.session.get(page_url, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
@@ -124,7 +205,7 @@ class APKComboSource(APKSource):
         filename = f"{package}-{ver}.{file_type}"
         out_path = output_dir / filename
 
-        sys.stderr.write(f"[apkcombo] Downloading {package} v{ver}\n")
+        log_source(self.name, f"Downloading {package} v{ver}")
         # APKCombo R2: HEAD=403, only GET works; follow redirects
         size = download_file(dl_url, out_path, self.session)
 

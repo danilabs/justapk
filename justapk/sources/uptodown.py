@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import re
-import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
 import requests
+from bs4 import BeautifulSoup
 
 from justapk.models import AppInfo, DownloadResult
 from justapk.sources.base import APKSource
-from justapk.utils import download_file, sha256_file
+from justapk.utils import HTTP_TIMEOUT, download_file, log_source, sha256_file
 
 # Reverse-engineered from Uptodown Android app v7.07
 _API_BASE = "https://www.uptodown.app/eapi"
 _APIKEY_SECRET = "$(=a%\u00b7!45J&S"  # $(=a%·!45J&S
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 def _generate_apikey() -> str:
@@ -48,7 +53,7 @@ class UptodownSource(APKSource):
         return self.session.get(
             f"{_API_BASE}{path}",
             headers=_api_headers(),
-            timeout=30,
+            timeout=HTTP_TIMEOUT,
         )
 
     def search(self, query: str) -> list[AppInfo]:
@@ -117,6 +122,49 @@ class UptodownSource(APKSource):
         data = resp.json()
         return data.get("data", data)
 
+    def _resolve_slug(self, package: str) -> str | None:
+        """Resolve package name to Uptodown URL slug via API."""
+        app_id = self._resolve_app_id(package)
+        if not app_id:
+            return None
+        detail = self._get_detail(app_id)
+        if not detail:
+            return None
+        url_share = detail.get("urlShare", "")
+        if url_share:
+            m = re.match(r"https://([^.]+)\.uptodown\.com", url_share)
+            if m:
+                return m.group(1)
+        return None
+
+    def list_versions(self, package: str) -> list[tuple[str, str]]:
+        """Scrape version list from the web versions page."""
+        slug = self._resolve_slug(package)
+        if not slug:
+            return []
+
+        resp = self.session.get(
+            f"https://{slug}.en.uptodown.com/android/versions",
+            headers={"User-Agent": _BROWSER_UA},
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        versions: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for el in soup.select(".version"):
+            v = el.get_text(strip=True)
+            if v and re.match(r'[\d]+\.[\d]', v) and v not in seen:
+                seen.add(v)
+                # Look for a sibling or nearby date element
+                parent = el.parent
+                date_el = parent.select_one(".date") if parent else None
+                date_str = date_el.get_text(strip=True) if date_el else ""
+                versions.append((v, date_str))
+        return versions
+
     def download(self, package: str, output_dir: Path, version: str | None = None) -> DownloadResult:
         app_id = self._resolve_app_id(package)
         if not app_id:
@@ -147,7 +195,7 @@ class UptodownSource(APKSource):
         filename = f"{real_pkg}-{ver}.apk" if ver else f"{real_pkg}.apk"
         out_path = output_dir / filename
 
-        sys.stderr.write(f"[uptodown] Downloading {real_pkg} v{ver}\n")
+        log_source(self.name, f"Downloading {real_pkg} v{ver}")
         size = download_file(dl_url, out_path, self.session, headers=dl_headers)
 
         return DownloadResult(
@@ -161,17 +209,11 @@ class UptodownSource(APKSource):
 
     def _get_download_url_web(self, slug: str) -> tuple[str | None, dict[str, str]]:
         """Get download URL + required headers from web page (data-url token)."""
-        from bs4 import BeautifulSoup
-
-        _browser_ua = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
-        )
         referer = f"https://{slug}.en.uptodown.com/"
         resp = self.session.get(
             f"https://{slug}.en.uptodown.com/android/download",
-            headers={"User-Agent": _browser_ua, "Referer": referer},
-            timeout=30,
+            headers={"User-Agent": _BROWSER_UA, "Referer": referer},
+            timeout=HTTP_TIMEOUT,
         )
         if resp.status_code != 200:
             return None, {}
@@ -180,5 +222,5 @@ class UptodownSource(APKSource):
         if not btn or not btn.get("data-url"):
             return None, {}
         # CDN requires Referer + browser UA — pass as per-request headers
-        cdn_headers = {"Referer": referer, "User-Agent": _browser_ua}
+        cdn_headers = {"Referer": referer, "User-Agent": _BROWSER_UA}
         return f"https://dw.uptodown.com/dwn/{btn['data-url']}", cdn_headers

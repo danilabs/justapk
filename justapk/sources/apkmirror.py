@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import re
-import sys
 from pathlib import Path
 
 from bs4 import BeautifulSoup
 
 from justapk.models import AppInfo, DownloadResult
 from justapk.sources.base import APKSource
-from justapk.utils import HTTP_TIMEOUT, create_cf_session, download_file, sha256_file
+from justapk.utils import HTTP_TIMEOUT, create_cf_session, download_file, log_source, sha256_file
 
 
 class APKMirrorSource(APKSource):
@@ -65,6 +64,22 @@ class APKMirrorSource(APKSource):
                 return f"{self.BASE}{href}" if not href.startswith("http") else href
         return None
 
+    def _find_app_slug(self, package: str) -> str | None:
+        """Extract the app slug from a release page URL.
+
+        APKMirror URLs follow: /apk/<developer>/<app-slug>/<release-slug>/
+        We need <app-slug> for the uploads page.
+        """
+        release_url = self._search_app(package)
+        if not release_url:
+            return None
+        # Parse: https://www.apkmirror.com/apk/developer/app-slug/release-slug/
+        parts = release_url.rstrip("/").split("/")
+        # Expected: ['https:', '', 'www.apkmirror.com', 'apk', developer, app-slug, ...]
+        if len(parts) >= 6 and parts[3] == "apk":
+            return parts[5]
+        return None
+
     def get_info(self, package: str) -> AppInfo | None:
         release_url = self._search_app(package)
         if not release_url:
@@ -93,18 +108,89 @@ class APKMirrorSource(APKSource):
             source=self.name,
         )
 
+    def list_versions(self, package: str) -> list[tuple[str, str]]:
+        slug = self._find_app_slug(package)
+        if not slug:
+            return []
+
+        versions: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        url: str | None = f"{self.BASE}/uploads/?appcategory={slug}"
+
+        while url:
+            resp = self.session.get(url, timeout=HTTP_TIMEOUT)
+            if resp.status_code != 200:
+                break
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            for row in soup.select(".appRow"):
+                a = row.select_one("h5 a")
+                if not a:
+                    continue
+                text = a.get_text(strip=True)
+                m = re.search(r"([\d]+\.[\d]+[\d.]*)", text)
+                if m:
+                    v = m.group(1)
+                    if v not in seen:
+                        seen.add(v)
+                        date_el = row.select_one(".dateyear_utc")
+                        date_str = date_el.get_text(strip=True) if date_el else ""
+                        versions.append((v, date_str))
+
+            # Follow pagination
+            next_link = soup.select_one("a.nextpostslink[href]")
+            if next_link:
+                href = next_link.get("href", "")
+                url = f"{self.BASE}{href}" if not href.startswith("http") else href
+            else:
+                url = None
+
+        return versions
+
+    def _find_release_url_for_version(self, package: str, version: str) -> str | None:
+        """Find the release page URL for a specific version."""
+        slug = self._find_app_slug(package)
+        if not slug:
+            return None
+
+        url: str | None = f"{self.BASE}/uploads/?appcategory={slug}"
+        while url:
+            resp = self.session.get(url, timeout=HTTP_TIMEOUT)
+            if resp.status_code != 200:
+                break
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            for row in soup.select(".appRow"):
+                a = row.select_one("h5 a[href]")
+                if not a:
+                    continue
+                text = a.get_text(strip=True)
+                if version in text:
+                    href = str(a.get("href", ""))
+                    return f"{self.BASE}{href}" if not href.startswith("http") else href
+
+            next_link = soup.select_one("a.nextpostslink[href]")
+            if next_link:
+                href = next_link.get("href", "")
+                url = f"{self.BASE}{href}" if not href.startswith("http") else href
+            else:
+                url = None
+
+        return None
+
     def download(self, package: str, output_dir: Path, version: str | None = None) -> DownloadResult:
-        # Step 1: Find the release page
-        release_url = self._search_app(package)
-        if not release_url:
-            raise RuntimeError(f"[apkmirror] Package not found: {package}")
+        # Step 1: Find the release page (version-specific or latest)
+        if version:
+            release_url = self._find_release_url_for_version(package, version)
+            if not release_url:
+                raise RuntimeError(f"[apkmirror] Version {version} not found for: {package}")
+        else:
+            release_url = self._search_app(package)
+            if not release_url:
+                raise RuntimeError(f"[apkmirror] Package not found: {package}")
 
         resp = self.session.get(release_url, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
-
-        # Verify page actually belongs to this package
-        if package not in resp.text:
-            raise RuntimeError(f"[apkmirror] Package not found: {package}")
 
         soup = BeautifulSoup(resp.text, "lxml")
 
@@ -163,7 +249,7 @@ class APKMirrorSource(APKSource):
         filename = f"{package}-{ver}.apk"
         out_path = output_dir / filename
 
-        sys.stderr.write(f"[apkmirror] Downloading {package} v{ver}\n")
+        log_source(self.name, f"Downloading {package} v{ver}")
         size = download_file(apk_url, out_path, self.session)
 
         return DownloadResult(

@@ -9,6 +9,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from justapk.utils import log_info, log_ok, log_warn
+
 
 def _safe_extractall(zf: zipfile.ZipFile, dest: Path) -> None:
     """Extract ZIP contents with path traversal protection."""
@@ -72,18 +74,18 @@ def convert_xapk_to_apk(xapk_path: Path, output_dir: Path | None = None) -> Path
 
         # Merge splits into single APK
         split_names = [a.stem for a in config_apks]
-        sys.stderr.write(f"[xapk] Merging {len(config_apks)} splits: {', '.join(split_names)}\n")
+        log_info(f"Merging {len(config_apks)} splits: {', '.join(split_names)}")
 
         merged_path = tmp_path / "merged.apk"
         stats = _merge_splits(base_apk, config_apks, merged_path)
-        sys.stderr.write(f"[xapk] Merged: {stats['added']} files from splits\n")
+        log_ok(f"Merged: {stats['added']} files from splits")
 
         # Sign the merged APK
         signed = _try_sign(merged_path, tmp_path)
         if signed:
-            sys.stderr.write("[xapk] Signed with debug key\n")
+            log_ok("Signed with debug key")
         else:
-            sys.stderr.write("[xapk] Warning: unsigned (no keytool/jarsigner found)\n")
+            log_warn("Unsigned (no keytool/jarsigner found)")
 
         shutil.copy2(merged_path, out_path)
         return out_path

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import re
-import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 from bs4 import BeautifulSoup
 
 from justapk.models import AppInfo, DownloadResult
 from justapk.sources.base import APKSource
-from justapk.utils import HTTP_TIMEOUT, create_session, download_file, sha256_file
+from justapk.utils import HTTP_TIMEOUT, create_session, download_file, log_source, sha256_file
 
 # F-Droid JSON API — no HTML scraping needed
 _API_BASE = "https://f-droid.org/api/v1"
@@ -65,6 +65,28 @@ class FDroidSource(APKSource):
         resp.raise_for_status()
         return resp.json()
 
+    def list_versions(self, package: str) -> list[tuple[str, str]]:
+        data = self._get_package_json(package)
+        if not data:
+            return []
+        packages = data.get("packages", [])
+        versions: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for pkg in packages:
+            v = pkg.get("versionName", "")
+            if v and v not in seen:
+                seen.add(v)
+                added = pkg.get("added")
+                date_str = ""
+                if added:
+                    try:
+                        dt = datetime.fromtimestamp(added / 1000, tz=UTC)
+                        date_str = dt.strftime("%Y-%m-%d")
+                    except (OSError, ValueError):
+                        pass
+                versions.append((v, date_str))
+        return versions
+
     def download(self, package: str, output_dir: Path, version: str | None = None) -> DownloadResult:
         data = self._get_package_json(package)
         if not data:
@@ -102,7 +124,7 @@ class FDroidSource(APKSource):
         filename = f"{package}-{version_name}.apk"
         out_path = output_dir / filename
 
-        sys.stderr.write(f"[fdroid] Downloading {package} v{version_name}\n")
+        log_source(self.name, f"Downloading {package} v{version_name}")
         size = download_file(url, out_path, self.session)
 
         return DownloadResult(
